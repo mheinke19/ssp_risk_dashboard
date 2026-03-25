@@ -1,20 +1,5 @@
-# Core data
-pandas
-numpy
-pyarrow
-
-# Dashboard & viz
-plotly
-streamlit
-dash
-
-# Config & validation
-python-dotenv
-pydantic
-
-# ML-adjacent (für Laden/Verarbeiten/SHAP-Views)
-scikit-learn
-shap
-
-# Plotly export support (optional, aber oft praktisch)
-kaleido
+streamlit==1.55.0
+pandas==2.2.3
+numpy==2.2.6
+plotly==6.0.1
+altair<6
