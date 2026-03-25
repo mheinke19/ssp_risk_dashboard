@@ -24,7 +24,8 @@ st.set_page_config(
 # -----------------------------
 # Constants
 # -----------------------------
-DEFAULT_PATH = r"C:\Users\miche\Desktop\SSP Risk Explorer\project-ssp-risk-explorer\data\raw\actual\predictions_ssp.csv"
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_PATH = APP_DIR.parents[1] / "data" / "raw" / "actual" / "predictions_ssp.csv"
 
 POVERTY_LABELS = {
     "poverty_3usd": "Poverty line 3 USD/day",
