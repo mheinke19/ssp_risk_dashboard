@@ -2,12 +2,17 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from pathlib import Path
+import io
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import joblib
+import shap
+import matplotlib.pyplot as plt
+import xgboost
 
 
 # -----------------------------
@@ -26,11 +31,12 @@ st.set_page_config(
 # -----------------------------
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_PATH = APP_DIR.parents[1] / "data" / "raw" / "actual" / "predictions_ssp.csv"
+MODELS_DIR = APP_DIR.parents[1] / "models"
 
 POVERTY_LABELS = {
-    "poverty_3usd": "Poverty line 3 USD/day",
-    "poverty_8_3usd": "Poverty line 8.3 USD/day",
-    "poverty_10usd": "Poverty line 10 USD/day",
+    "poverty_3usd": "PHR at 3 USD/day [% of population]",
+    "poverty_8_3usd": "PHR at 8.3 USD/day [% of population]",
+    "poverty_10usd": "PHR at 10 USD/day [% of population]",
 }
 
 SCENARIO_LABELS = {
@@ -52,30 +58,53 @@ SCENARIO_SHORT = {
 SCENARIO_DESCRIPTIONS = {
     "SSP1": (
         "SSP1 — Sustainability: The world shifts toward inclusive development, stronger institutions, "
-        "better education, and environmentally conscious growth. Governance risks tend to evolve more "
+        "better education, and environmentally conscious growth. Poverty headcount ratios tend to evolve more "
         "favorably because vulnerability is reduced through cooperation, investment in human capital, "
         "and lower structural inequality."
     ),
     "SSP2": (
         "SSP2 — Middle of the Road: Development follows historical patterns without major breakthroughs "
-        "or major collapse. Governance risks improve in some places but persist in others, making this a "
+        "or major collapse. Poverty headcount ratios improve in some places but persist in others, making this a "
         "useful baseline scenario for comparing more optimistic and more adverse futures."
     ),
     "SSP3": (
         "SSP3 — Regional Rivalry: Countries become more fragmented, geopolitical tensions increase, and "
         "cooperation weakens. Lower investment, slower economic development, and institutional strain can "
-        "lead to higher vulnerability, weaker resilience, and stronger governance-related risk exposure."
+        "lead to higher vulnerability, weaker resilience, and higher poverty headcount ratios."
     ),
     "SSP4": (
         "SSP4 — Inequality: Development is highly uneven, with globally connected and well-resourced groups "
-        "benefiting while vulnerable populations lag behind. Governance risks can intensify because inequality "
+        "benefiting while vulnerable populations lag behind. Poverty headcount ratios can remain elevated because inequality "
         "limits adaptive capacity and concentrates fragility in already disadvantaged regions."
     ),
     "SSP5": (
         "SSP5 — Fossil-fueled Development: Rapid economic growth and technological progress continue, but "
         "development remains resource- and energy-intensive. Some countries may reduce poverty through growth, "
-        "yet long-term governance and climate-related risks can remain substantial due to unsustainable pathways."
+        "yet long-term vulnerabilities can remain substantial under unsustainable pathways."
     ),
+}
+
+MODEL_FEATURES = [
+    "gdp_per_capita",
+    "hdi",
+    "control_of_corruption",
+    "employment_agriculture",
+    "gini",
+]
+
+DASHBOARD_TO_MODEL_TARGET = {
+    "poverty_3usd": "poverty_3",
+    "poverty_8_3usd": "poverty_8_30",
+    "poverty_10usd": "poverty_10",
+}
+
+FEATURE_LABELS = {
+    "gdp_per_capita": "GDP per capita [USD/capita]",
+    "population": "Population [people]",
+    "hdi": "HDI [index]",
+    "control_of_corruption": "Control of Corruption [index]",
+    "employment_agriculture": "Employment in agriculture [% of total employment]",
+    "gini": "Gini index [0–100]",
 }
 
 
@@ -224,18 +253,40 @@ def load_data(path: str) -> pd.DataFrame:
 
         df.columns.name = None
 
-        # Keep only case B for dashboard usage
         if "approach" in df.columns:
             df = df[df["approach"] == "B"].copy()
 
-        return df
+    else:
+        df["year"] = df["year"].astype(int)
+        df["scenario"] = df["scenario"].astype(str)
+        if "approach" in df.columns:
+            df["approach"] = df["approach"].astype(str).str.strip().str.upper()
+            df = df[df["approach"] == "B"].copy()
 
-    # Already wide/dashboard-ready
-    df["year"] = df["year"].astype(int)
-    df["scenario"] = df["scenario"].astype(str)
-    if "approach" in df.columns:
-        df["approach"] = df["approach"].astype(str).str.strip().str.upper()
-        df = df[df["approach"] == "B"].copy()
+    # Clean numeric columns defensively
+    numeric_candidate_cols = [
+        "gdp_per_capita",
+        "population",
+        "hdi",
+        "control_of_corruption",
+        "employment_agriculture",
+        "gini",
+        "poverty_3usd",
+        "poverty_8_3usd",
+        "poverty_10usd",
+    ]
+
+    for col in numeric_candidate_cols:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .str.replace(r"^\[", "", regex=True)
+                .str.replace(r"\]$", "", regex=True)
+            )
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     return df
 
 
@@ -249,14 +300,154 @@ def add_continent(df_in: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------
+# SHAP / Model helpers
+# -----------------------------
+@st.cache_resource
+def load_xgb_model(target: str):
+    model_path = MODELS_DIR / f"XGBoost_{target}.pkl"
+    return joblib.load(model_path)
+
+
+def get_model_input(df_subset: pd.DataFrame) -> pd.DataFrame:
+    missing = [c for c in MODEL_FEATURES if c not in df_subset.columns]
+    if missing:
+        raise ValueError(f"Missing model features in dashboard data: {missing}")
+
+    X = df_subset[MODEL_FEATURES].copy()
+
+    for col in X.columns:
+        X[col] = (
+            X[col]
+            .astype(str)
+            .str.strip()
+            .str.replace(r"^\[", "", regex=True)
+            .str.replace(r"\]$", "", regex=True)
+        )
+        X[col] = pd.to_numeric(X[col], errors="coerce")
+
+    X = X.dropna()
+    return X
+
+
+@st.cache_data(show_spinner=False)
+def compute_shap_overview(df_subset: pd.DataFrame, poverty_metric: str, sample_size: int = 300):
+    target = DASHBOARD_TO_MODEL_TARGET[poverty_metric]
+    model = load_xgb_model(target)
+
+    X = get_model_input(df_subset)
+    if X.empty:
+        return None
+
+    if len(X) > sample_size:
+        X = X.sample(sample_size, random_state=42)
+
+    explainer = shap.TreeExplainer(model)
+    shap_values_raw = explainer.shap_values(X)
+
+    base_value = explainer.expected_value
+    if isinstance(base_value, (list, np.ndarray)):
+        base_value = float(np.array(base_value).flatten()[0])
+
+    shap_values = shap.Explanation(
+        values=shap_values_raw,
+        base_values=np.repeat(base_value, len(X)),
+        data=X.values,
+        feature_names=X.columns.tolist(),
+    )
+
+    importance = pd.DataFrame({
+        "feature": X.columns,
+        "mean_abs_shap": np.abs(shap_values.values).mean(axis=0)
+    }).sort_values("mean_abs_shap", ascending=False)
+
+    return {
+        "X": X,
+        "shap_values": shap_values,
+        "importance": importance,
+        "base_value": base_value,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def compute_single_country_shap(row_df: pd.DataFrame, poverty_metric: str):
+    target = DASHBOARD_TO_MODEL_TARGET[poverty_metric]
+    model = load_xgb_model(target)
+
+    X = get_model_input(row_df)
+    if X.empty:
+        return None
+
+    explainer = shap.TreeExplainer(model)
+    shap_values_raw = explainer.shap_values(X)
+
+    base_value = explainer.expected_value
+    if isinstance(base_value, (list, np.ndarray)):
+        base_value = float(np.array(base_value).flatten()[0])
+
+    explanation = shap.Explanation(
+        values=shap_values_raw[0],
+        base_values=base_value,
+        data=X.iloc[0].values,
+        feature_names=X.columns.tolist(),
+    )
+
+    prediction = float(model.predict(X)[0])
+
+    contrib_df = pd.DataFrame({
+        "feature": X.columns,
+        "feature_value": X.iloc[0].values,
+        "shap_value": explanation.values,
+    })
+
+    contrib_df["abs_shap"] = contrib_df["shap_value"].abs()
+    contrib_df = contrib_df.sort_values("abs_shap", ascending=False).drop(columns="abs_shap")
+
+    return {
+        "prediction": prediction,
+        "explanation": explanation,
+        "contrib_df": contrib_df,
+    }
+
+
+def render_shap_summary_plot(shap_values, max_display=10):
+    plt.figure(figsize=(10, 5.8))
+    shap.summary_plot(
+        shap_values.values,
+        features=shap_values.data,
+        feature_names=shap_values.feature_names,
+        show=False,
+        max_display=max_display
+    )
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close()
+    buf.seek(0)
+    return buf
+
+
+def render_shap_waterfall_plot(explanation, max_display=10):
+    plt.figure()
+    shap.plots.waterfall(explanation, max_display=max_display, show=False)
+    fig = plt.gcf()
+    fig.set_size_inches(9, 5.5)
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close()
+    buf.seek(0)
+    return buf
+
+
+# -----------------------------
 # Load data
 # -----------------------------
 df = load_data(DEFAULT_PATH)
 df = add_continent(df)
 
-ID_COLS = [c for c in ["iso3", "country", "scenario", "year", "approach", "continent"] if c in df.columns]
+ID_COLS = [c for c in ["iso3", "country", "scenario", "year", "continent"] if c in df.columns]
 POVERTY_COLS = [c for c in df.columns if c.startswith("poverty_")]
-FEATURE_COLS = [c for c in df.columns if c not in ID_COLS + POVERTY_COLS]
+FEATURE_COLS = [c for c in df.columns if c not in ID_COLS + POVERTY_COLS + ["approach"]]
 
 
 # -----------------------------
@@ -294,7 +485,7 @@ with st.sidebar:
     st.markdown(
         """
         <div class="tiny-note">
-        Dashboard view uses <b>case B</b> only. For years above <b>2050</b>, some predictor variables are extrapolated.
+        Disclaimer: For years above <b>2050</b>, some predictor variables are extrapolated.
         </div>
         """,
         unsafe_allow_html=True,
@@ -304,18 +495,18 @@ with st.sidebar:
         st.markdown(
             """
             <div class="tiny-alert">
-            Selected year is above 2050 — some input variables are extrapolated in case B.
+            Selected year is above 2050 — some input variables are extrapolated.
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     poverty_metric = st.selectbox(
-        "Risk metric",
+        "Poverty line",
         options=POVERTY_COLS,
         index=0,
         format_func=lambda x: POVERTY_LABELS.get(x, x),
-        help="Select the poverty threshold used for map coloring, rankings, and charts.",
+        help="Select the poverty line for which the predicted poverty headcount ratio is shown across the dashboard.",
     )
 
     map_scale = st.selectbox(
@@ -337,14 +528,14 @@ with st.sidebar:
     show_top_n = st.slider("Show top N countries in rankings", 5, 30, 10, 1)
 
     highlight_top_map = st.toggle(
-        "Highlight top-risk countries on map",
+        "Highlight top countries on map",
         value=True,
-        help="Emphasize the highest-risk countries in the current view with a stronger border outline.",
+        help="Emphasize the highest displayed values in the current view with a stronger border outline.",
     )
 
     st.divider()
     st.caption(
-        "The quick data peek uses the real predictor variables from the modeling dataset."
+        "The quick data peek uses the predictor variables underlying the displayed model outputs."
     )
 
 
@@ -385,14 +576,13 @@ st.markdown(
     f"""
     <div class="header-title">🌍 Global Governance Risk Explorer</div>
     <div class="header-subtitle">
-      Policy-oriented exploration of poverty exposure under alternative SSP futures.
+      Policy-oriented exploration of poverty headcount ratios (PHR) under alternative SSP futures.
     </div>
     <div class="badge-row">
       <span class="pill">Scenario: {selected_scenario_label}</span>
       <span class="pill">Year: {year}</span>
       <span class="pill">Metric: {selected_metric_label}</span>
       <span class="pill">Region: {region_focus}</span>
-      <span class="pill">Approach: Case B</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -401,13 +591,16 @@ st.markdown(
 with st.expander("About this dashboard and how to interpret it", expanded=False):
     st.markdown(
         f"""
-This dashboard combines SSP-based scenario projections with a selected poverty-related risk indicator to support policy-oriented exploration across countries and regions.
+This dashboard combines SSP-based scenario projections with a selected poverty headcount ratio indicator to support policy-oriented exploration across countries and regions.
 
 **How to read the views**
-- The **Risk Map** highlights the geographic distribution of predicted risk for the chosen scenario and year.
-- **Scenario Comparison** shows how the selected poverty threshold differs across SSP futures.
+- The **Risk Map** highlights the geographic distribution of the predicted poverty headcount ratio for the chosen scenario and year.
+- **Scenario Comparison** shows how the selected poverty headcount ratio differs across SSP futures.
 - **Regional Trends** aggregates country-level outcomes into continent-level trajectories.
-- The **Policy Focus View** surfaces the highest-risk countries under the current settings.
+- **Explainability** shows which model input variables are most influential for the selected view and how they affect a single-country prediction.
+
+**What is shown**
+- The predicted outcome is the **Poverty Headcount Ratio** at the selected poverty line, measured as **% of population**.
 
 **Detailed SSP descriptions**
 - **SSP1 — Sustainability:** {SCENARIO_DESCRIPTIONS["SSP1"].replace("SSP1 — Sustainability: ", "")}
@@ -424,12 +617,12 @@ This dashboard combines SSP-based scenario projections with a selected poverty-r
 - Employment in agriculture
 - Gini inequality index
 
-**Case selection**
-- This dashboard displays **case B only**.
-- For projection years **above 2050**, some input variables in case B are **extrapolated** and should be interpreted with that limitation in mind.
+**Extrapolated values**
+- For projection years **above 2050**, some input variables are **extrapolated** and should be interpreted with that limitation in mind.
 
-**Important note**
-- SHAP explainability is intentionally left out for now and can be integrated later once the final model artifacts are available.
+**Explainability note**
+- The Explainability tab uses **SHAP values** from the final **XGBoost** models for the selected poverty line.
+- Only the variables that were actually used to train the model are included in the SHAP analysis.
         """
     )
 
@@ -449,10 +642,13 @@ high_risk_share = (
     if not base_metric.empty else np.nan
 )
 
-kpi1.metric("Average risk (%)", f"{mean_val:,.2f}" if np.isfinite(mean_val) else "—")
-kpi2.metric("Median risk (%)", f"{median_val:,.2f}" if np.isfinite(median_val) else "—")
-kpi3.metric("Population-weighted average (%)", f"{pw_mean:,.2f}" if (pw_mean is not None and np.isfinite(pw_mean)) else "—")
-kpi4.metric(f"Share above {high_risk_threshold:.0f}% (%)", f"{high_risk_share:,.1f}" if np.isfinite(high_risk_share) else "—")
+kpi1.metric("Average headcount ratio [%]", f"{mean_val:,.2f}" if np.isfinite(mean_val) else "—")
+kpi2.metric("Median headcount ratio [%]", f"{median_val:,.2f}" if np.isfinite(median_val) else "—")
+kpi3.metric("Population-weighted average [%]", f"{pw_mean:,.2f}" if (pw_mean is not None and np.isfinite(pw_mean)) else "—")
+kpi4.metric(
+    f"Share above {high_risk_threshold:.0f}% headcount [% of countries]",
+    f"{high_risk_share:,.1f}" if np.isfinite(high_risk_share) else "—"
+)
 
 
 # -----------------------------
@@ -464,7 +660,7 @@ if not download_df.empty:
     st.download_button(
         label="Download current filtered view as CSV",
         data=csv_bytes,
-        file_name=f"ssp_risk_view_caseB_{scenario}_{year}.csv",
+        file_name=f"ssp_poverty_headcount_view_{scenario}_{year}.csv",
         mime="text/csv",
     )
 
@@ -511,8 +707,8 @@ else:
 # -----------------------------
 # Tabs
 # -----------------------------
-tab_map, tab_compare, tab_trends = st.tabs(
-    ["🗺️ Risk Map", "📊 Scenario Comparison", "📈 Regional Trends"]
+tab_map, tab_compare, tab_trends, tab_shap = st.tabs(
+    ["🗺️ Risk Map", "📊 Scenario Comparison", "📈 Regional Trends", "🧠 Explainability"]
 )
 
 
@@ -523,7 +719,7 @@ with tab_map:
     st.markdown(
         """
         <div class="section-note">
-        <b>Map view:</b> Explore the selected SSP scenario spatially. Use the region focus to zoom into a continent and the map theme switch in the sidebar to change the visual style.
+        <b>Map view:</b> Explore the selected SSP scenario spatially. The map shows the predicted poverty headcount ratio at the selected poverty line, measured as % of population.
         </div>
         """,
         unsafe_allow_html=True,
@@ -541,19 +737,19 @@ with tab_map:
                 bins = [-np.inf, 5, 15, 30, 50, np.inf]
                 labels = ["Very Low", "Low", "Moderate", "High", "Extreme"]
 
-                map_df["risk_band"] = pd.cut(map_df[poverty_metric], bins=bins, labels=labels)
+                map_df["headcount_band"] = pd.cut(map_df[poverty_metric], bins=bins, labels=labels)
 
                 fig = px.choropleth(
                     map_df,
                     locations="iso3",
-                    color="risk_band",
+                    color="headcount_band",
                     hover_name="country",
                     hover_data={
                         poverty_metric: ":.2f",
                         "continent": True,
                         "iso3": True,
                     },
-                    category_orders={"risk_band": labels},
+                    category_orders={"headcount_band": labels},
                     title=f"{selected_metric_label} — {selected_scenario_label} — {year}",
                     projection="natural earth",
                     color_discrete_sequence=px.colors.sequential.Plasma_r[:len(labels)],
@@ -580,7 +776,7 @@ with tab_map:
                 hovertemplate=(
                     "<b>%{hovertext}</b><br>"
                     "ISO3: %{location}<br>"
-                    f"{selected_metric_label}: %{{z:.2f}}<extra></extra>"
+                    f"{selected_metric_label}: %{{z:.2f}} % of population<extra></extra>"
                 )
             )
 
@@ -602,7 +798,7 @@ with tab_map:
                             marker_line_color=top_outline_color,
                             marker_line_width=2.4,
                             hoverinfo="skip",
-                            name="Top-risk countries",
+                            name="Top countries",
                         )
                     )
 
@@ -709,7 +905,10 @@ with tab_map:
         existing_preview_cols = [c for c in preview_cols if c in peek_df.columns]
 
         preview_display = peek_df[existing_preview_cols].head(12).copy()
-        preview_display = preview_display.rename(columns={poverty_metric: selected_metric_label})
+        preview_display = preview_display.rename(columns={
+            poverty_metric: selected_metric_label,
+            **FEATURE_LABELS,
+        })
 
         st.dataframe(
             preview_display,
@@ -725,7 +924,7 @@ with tab_compare:
     st.markdown(
         """
         <div class="section-note">
-        <b>Scenario comparison:</b> Compare how the selected poverty threshold differs across SSP futures in the chosen year.
+        <b>Scenario comparison:</b> Compare how the selected poverty headcount ratio differs across SSP futures in the chosen year.
         </div>
         """,
         unsafe_allow_html=True,
@@ -851,14 +1050,14 @@ with tab_trends:
         regional = (
             g.groupby(["continent", "scenario", "year"], as_index=False)
             .apply(lambda x: np.sum(x["v"] * x["w"]) / np.sum(x["w"]) if np.sum(x["w"]) else np.nan)
-            .rename(columns={None: "risk_pw_mean"})
+            .rename(columns={None: "headcount_pw_mean"})
         )
-        ycol = "risk_pw_mean"
-        yname = "Population-weighted mean risk (%)"
+        ycol = "headcount_pw_mean"
+        yname = "Population-weighted poverty headcount ratio [% of population]"
     else:
         regional = trend.groupby(["continent", "scenario", "year"], as_index=False)[poverty_metric].mean()
         ycol = poverty_metric
-        yname = "Mean risk (%)"
+        yname = "Mean poverty headcount ratio [% of population]"
 
     c1, c2 = st.columns([1.15, 1])
 
@@ -917,13 +1116,150 @@ with tab_trends:
 
 
 # -----------------------------
+# EXPLAINABILITY TAB
+# -----------------------------
+with tab_shap:
+    st.markdown(
+        """
+        <div class="section-note">
+        <b>Explainability:</b> This view uses SHAP values from the final XGBoost model to show which variables drive the predicted poverty headcount ratios.
+        The overview reflects the currently selected dashboard subset. A single-country explanation can be generated on demand.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c_top1, c_top2 = st.columns([1, 1])
+    with c_top1:
+        shap_sample_size = st.slider(
+            "Sample size for overview SHAP",
+            min_value=50,
+            max_value=500,
+            value=250,
+            step=50,
+            help="To keep the dashboard responsive, the SHAP overview uses a sample of the currently filtered observations."
+        )
+    with c_top2:
+        show_beeswarm = st.toggle(
+            "Show SHAP summary plot",
+            value=True,
+            help="The beeswarm plot gives a richer overview, but it is visually denser than the bar chart."
+        )
+
+    try:
+        shap_result = compute_shap_overview(
+            base_metric,
+            poverty_metric=poverty_metric,
+            sample_size=shap_sample_size,
+        )
+    except Exception as e:
+        shap_result = None
+        st.error(f"SHAP overview could not be computed: {e}")
+
+    if shap_result is None:
+        st.info("No SHAP explanation available for the current filter selection.")
+    else:
+        st.caption(
+            f"Overview explanation for {selected_metric_label} under {selected_scenario_label}, year {year}, region {region_focus}."
+        )
+        st.caption(
+            "Higher mean absolute SHAP values indicate variables that contribute more strongly to the model’s predictions within the currently selected subset."
+        )
+
+        c1, c2 = st.columns([1, 1.35])
+
+        with c1:
+            imp_display = shap_result["importance"].copy()
+            imp_display["feature"] = imp_display["feature"].replace(FEATURE_LABELS)
+
+            fig_imp = px.bar(
+                imp_display,
+                x="mean_abs_shap",
+                y="feature",
+                orientation="h",
+                title="Variable importance (mean absolute SHAP value)",
+            )
+            fig_imp.update_layout(
+                template="plotly_white",
+                height=430,
+                margin=dict(l=0, r=0, t=60, b=0),
+                xaxis_title="Average contribution magnitude",
+                yaxis_title="",
+            )
+            fig_imp.update_yaxes(categoryorder="total ascending")
+            st.plotly_chart(fig_imp, use_container_width=True)
+
+        with c2:
+            if show_beeswarm:
+                buf = render_shap_summary_plot(shap_result["shap_values"], max_display=10)
+                st.image(buf, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("Country-level explanation")
+    st.caption("Explains one country for the currently selected scenario, year, region, and poverty line.")
+    st.caption("Positive SHAP values increase the predicted poverty headcount ratio, while negative SHAP values decrease it relative to the model baseline.")
+
+    country_options = sorted(base_metric["country"].dropna().unique().tolist())
+
+    if not country_options:
+        st.info("No country available for the current filter selection.")
+    else:
+        selected_country_shap = st.selectbox(
+            "Select country",
+            options=country_options,
+            key="shap_country_selector",
+        )
+
+        country_row = base_metric[base_metric["country"] == selected_country_shap].head(1).copy()
+
+        if st.button("Explain selected country"):
+            try:
+                single_result = compute_single_country_shap(country_row, poverty_metric)
+            except Exception as e:
+                single_result = None
+                st.error(f"Country-level SHAP could not be computed: {e}")
+
+            if single_result is None:
+                st.warning("No valid feature data available for this country.")
+            else:
+                st.metric(
+                    "Predicted poverty headcount ratio [% of population]",
+                    f"{single_result['prediction']:.2f}"
+                )
+
+                wc1, wc2 = st.columns([1.35, 1])
+
+                with wc1:
+                    buf = render_shap_waterfall_plot(single_result["explanation"], max_display=10)
+                    st.image(buf, use_container_width=True)
+
+                with wc2:
+                    contrib_display = single_result["contrib_df"].copy()
+                    contrib_display["feature"] = contrib_display["feature"].replace(FEATURE_LABELS)
+                    contrib_display["feature_value"] = contrib_display["feature_value"].round(3)
+                    contrib_display["shap_value"] = contrib_display["shap_value"].round(3)
+                    contrib_display = contrib_display.rename(columns={
+                        "feature": "Feature",
+                        "feature_value": "Feature value",
+                        "shap_value": "SHAP contribution",
+                    })
+
+                    st.dataframe(
+                        contrib_display,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+
+# -----------------------------
 # Footer
 # -----------------------------
 st.markdown(
     """
     <div class="footer-box">
-    <b>Project note:</b> This dashboard is designed as an interactive policy exploration tool for SSP-based governance risk analysis.
-    The current dataset includes the real model predictor variables and is restricted to case B. For years above 2050, some case-B inputs are extrapolated and should be interpreted accordingly.
+    <b>Project note:</b> This dashboard is designed as an interactive policy exploration tool for SSP-based poverty headcount ratio analysis.
+    For years above 2050, some inputs are extrapolated and should be interpreted accordingly.
     </div>
     """,
     unsafe_allow_html=True,
