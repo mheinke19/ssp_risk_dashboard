@@ -319,13 +319,11 @@ def get_model_input(df_subset: pd.DataFrame) -> pd.DataFrame:
         X[col] = (
             X[col]
             .astype(str)
-            .str.strip()
-            .str.replace(r"^\[", "", regex=True)
-            .str.replace(r"\]$", "", regex=True)
+            .str.extract(r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', expand=False)
         )
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
-    X = X.dropna()
+    X = X.astype("float64").dropna()
     return X
 
 
