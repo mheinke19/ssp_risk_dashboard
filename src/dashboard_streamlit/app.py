@@ -3,6 +3,8 @@ warnings.filterwarnings("ignore")
 
 from pathlib import Path
 import io
+import re
+import ast
 
 import streamlit as st
 import pandas as pd
@@ -13,7 +15,6 @@ import joblib
 import shap
 import matplotlib.pyplot as plt
 import xgboost
-
 
 
 # -----------------------------
@@ -205,6 +206,47 @@ st.markdown(
 
 
 # -----------------------------
+# Robust numeric cleaning
+# -----------------------------
+def clean_numeric_value(x):
+    if pd.isna(x):
+        return np.nan
+
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+
+    if isinstance(x, (list, tuple, np.ndarray)):
+        if len(x) == 0:
+            return np.nan
+        return clean_numeric_value(x[0])
+
+    s = str(x).strip()
+
+    if s == "":
+        return np.nan
+
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, (list, tuple, np.ndarray)):
+            if len(parsed) == 0:
+                return np.nan
+            return clean_numeric_value(parsed[0])
+        if isinstance(parsed, (int, float, np.integer, np.floating)):
+            return float(parsed)
+    except Exception:
+        pass
+
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+    if match:
+        try:
+            return float(match.group(0))
+        except Exception:
+            return np.nan
+
+    return np.nan
+
+
+# -----------------------------
 # Data loading
 # -----------------------------
 @st.cache_data
@@ -264,7 +306,6 @@ def load_data(path: str) -> pd.DataFrame:
             df["approach"] = df["approach"].astype(str).str.strip().str.upper()
             df = df[df["approach"] == "B"].copy()
 
-    # Clean numeric columns defensively
     numeric_candidate_cols = [
         "gdp_per_capita",
         "population",
@@ -279,14 +320,7 @@ def load_data(path: str) -> pd.DataFrame:
 
     for col in numeric_candidate_cols:
         if col in df.columns:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.strip()
-                .str.replace(r"^\[", "", regex=True)
-                .str.replace(r"\]$", "", regex=True)
-            )
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = df[col].apply(clean_numeric_value).astype("float64")
 
     return df
 
@@ -317,15 +351,45 @@ def get_model_input(df_subset: pd.DataFrame) -> pd.DataFrame:
     X = df_subset[MODEL_FEATURES].copy()
 
     for col in X.columns:
-        X[col] = (
-            X[col]
-            .astype(str)
-            .str.extract(r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)', expand=False)
-        )
-        X[col] = pd.to_numeric(X[col], errors="coerce")
+        X[col] = X[col].apply(clean_numeric_value)
 
-    X = X.astype("float64").dropna()
+    X = X.astype("float64")
+    X = X.dropna()
+
     return X
+
+
+def _get_booster_from_model(model):
+    return model.get_booster() if hasattr(model, "get_booster") else model
+
+
+def _compute_xgb_contribs(model, X: pd.DataFrame):
+    """
+    Returns:
+      contribs: np.ndarray of shape (n_rows, n_features)
+      bias:     np.ndarray of shape (n_rows,)
+    """
+    booster = _get_booster_from_model(model)
+
+    dmat = xgboost.DMatrix(
+        X,
+        feature_names=X.columns.tolist()
+    )
+
+    raw_contribs = booster.predict(
+        dmat,
+        pred_contribs=True,
+        approx_contribs=False,
+        validate_features=True,
+    )
+
+    if raw_contribs.ndim != 2:
+        raise ValueError(f"Unexpected contribution shape: {raw_contribs.shape}")
+
+    contribs = raw_contribs[:, :-1]
+    bias = raw_contribs[:, -1]
+
+    return contribs, bias
 
 
 @st.cache_data(show_spinner=False)
@@ -340,30 +404,25 @@ def compute_shap_overview(df_subset: pd.DataFrame, poverty_metric: str, sample_s
     if len(X) > sample_size:
         X = X.sample(sample_size, random_state=42)
 
-    explainer = shap.TreeExplainer(model)
-    shap_values_raw = explainer.shap_values(X)
-
-    base_value = explainer.expected_value
-    if isinstance(base_value, (list, np.ndarray)):
-        base_value = float(np.array(base_value).flatten()[0])
+    contribs, bias = _compute_xgb_contribs(model, X)
 
     shap_values = shap.Explanation(
-        values=shap_values_raw,
-        base_values=np.repeat(base_value, len(X)),
+        values=contribs,
+        base_values=bias,
         data=X.values,
         feature_names=X.columns.tolist(),
     )
 
     importance = pd.DataFrame({
         "feature": X.columns,
-        "mean_abs_shap": np.abs(shap_values.values).mean(axis=0)
+        "mean_abs_shap": np.abs(contribs).mean(axis=0)
     }).sort_values("mean_abs_shap", ascending=False)
 
     return {
         "X": X,
         "shap_values": shap_values,
         "importance": importance,
-        "base_value": base_value,
+        "base_value": float(np.mean(bias)),
     }
 
 
@@ -376,26 +435,21 @@ def compute_single_country_shap(row_df: pd.DataFrame, poverty_metric: str):
     if X.empty:
         return None
 
-    explainer = shap.TreeExplainer(model)
-    shap_values_raw = explainer.shap_values(X)
+    contribs, bias = _compute_xgb_contribs(model, X)
 
-    base_value = explainer.expected_value
-    if isinstance(base_value, (list, np.ndarray)):
-        base_value = float(np.array(base_value).flatten()[0])
+    prediction = float(model.predict(X)[0])
 
     explanation = shap.Explanation(
-        values=shap_values_raw[0],
-        base_values=base_value,
+        values=contribs[0],
+        base_values=float(bias[0]),
         data=X.iloc[0].values,
         feature_names=X.columns.tolist(),
     )
 
-    prediction = float(model.predict(X)[0])
-
     contrib_df = pd.DataFrame({
         "feature": X.columns,
         "feature_value": X.iloc[0].values,
-        "shap_value": explanation.values,
+        "shap_value": contribs[0],
     })
 
     contrib_df["abs_shap"] = contrib_df["shap_value"].abs()
@@ -403,6 +457,7 @@ def compute_single_country_shap(row_df: pd.DataFrame, poverty_metric: str):
 
     return {
         "prediction": prediction,
+        "base_value": float(bias[0]),
         "explanation": explanation,
         "contrib_df": contrib_df,
     }
@@ -620,8 +675,8 @@ This dashboard combines SSP-based scenario projections with a selected poverty h
 - For projection years **above 2050**, some input variables are **extrapolated** and should be interpreted with that limitation in mind.
 
 **Explainability note**
-- The Explainability tab uses **SHAP values** from the final **XGBoost** models for the selected poverty line.
-- Only the variables that were actually used to train the model are included in the SHAP analysis.
+- The Explainability tab uses **SHAP-compatible feature contributions** from the final **XGBoost** models for the selected poverty line.
+- Only the variables that were actually used to train the model are included in the explainability analysis.
         """
     )
 
@@ -1121,7 +1176,7 @@ with tab_shap:
     st.markdown(
         """
         <div class="section-note">
-        <b>Explainability:</b> This view uses SHAP values from the final XGBoost model to show which variables drive the predicted poverty headcount ratios.
+        <b>Explainability:</b> This view uses SHAP-compatible feature contributions from the final XGBoost model to show which variables drive the predicted poverty headcount ratios.
         The overview reflects the currently selected dashboard subset. A single-country explanation can be generated on demand.
         </div>
         """,
