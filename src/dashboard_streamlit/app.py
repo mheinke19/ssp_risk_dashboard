@@ -14,6 +14,45 @@ import shap
 import matplotlib.pyplot as plt
 import xgboost
 
+import shap
+from shap.explainers._tree import XGBTreeModelLoader
+
+_original_xgb_loader_init = XGBTreeModelLoader.__init__
+
+def _patched_xgb_loader_init(self, xgb_model):
+    try:
+        _original_xgb_loader_init(self, xgb_model)
+    except ValueError as e:
+        if "could not convert string to float" not in str(e):
+            raise
+
+        import json
+
+        raw = xgb_model.save_raw(raw_format="ubj")
+        model_json = json.loads(raw.decode("utf-8"))
+
+        learner_model_param = model_json["learner"]["learner_model_param"]
+        bs = learner_model_param.get("base_score", 0.5)
+
+        if isinstance(bs, list):
+            learner_model_param["base_score"] = float(bs[0])
+        elif isinstance(bs, str) and bs.startswith("[") and bs.endswith("]"):
+            learner_model_param["base_score"] = float(bs[1:-1].split(",")[0])
+        else:
+            learner_model_param["base_score"] = float(bs)
+
+        original_save_raw = xgb_model.save_raw
+
+        def _fake_save_raw(*args, **kwargs):
+            return json.dumps(model_json).encode("utf-8")
+
+        xgb_model.save_raw = _fake_save_raw
+        try:
+            _original_xgb_loader_init(self, xgb_model)
+        finally:
+            xgb_model.save_raw = original_save_raw
+
+XGBTreeModelLoader.__init__ = _patched_xgb_loader_init
 
 # -----------------------------
 # Page config
